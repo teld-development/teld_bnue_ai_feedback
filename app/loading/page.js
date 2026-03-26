@@ -1,0 +1,312 @@
+"use client";
+
+import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { upload } from "@vercel/blob/client";
+
+// IndexedDB 유틸리티
+const DB_NAME = "VideoAnalysisDB";
+const STORE_NAME = "pendingVideos";
+
+const openDB = () => {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, 1);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+        request.onupgradeneeded = (event) => {
+            const db = event.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME);
+            }
+        };
+    });
+};
+
+const getVideoDB = async (key) => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, "readonly");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.get(key);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+    });
+};
+
+const deleteVideoDB = async (key) => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, "readwrite");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.delete(key);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve();
+    });
+};
+
+const ANALYSIS_STEPS = [
+    { id: "upload", label: "클라우드에 업로드 중" },
+    { id: "transfer", label: "Gemini로 전송 중" },
+    { id: "analyze", label: "AI 분석 진행 중" },
+    { id: "generate", label: "피드백 생성 중" },
+];
+
+export default function LoadingPage() {
+    const router = useRouter();
+    const [currentStep, setCurrentStep] = useState(0);
+    const [progress, setProgress] = useState(0);
+    const [error, setError] = useState("");
+    const [elapsedTime, setElapsedTime] = useState(0);
+    const [uploadProgress, setUploadProgress] = useState(0);
+
+    useEffect(() => {
+        // 시간 카운터
+        const timer = setInterval(() => {
+            setElapsedTime((prev) => prev + 1);
+        }, 1000);
+
+        const startAnalysis = async () => {
+            try {
+                // IndexedDB에서 비디오 데이터 가져오기
+                const videoData = await getVideoDB("pendingVideo");
+
+                if (!videoData) {
+                    setError("분석할 데이터가 없습니다. 영상을 다시 업로드해주세요.");
+                    clearInterval(timer);
+                    return;
+                }
+
+                const { buffer, name, type, prepareData } = videoData;
+
+                // ArrayBuffer를 Blob으로 변환
+                const blob = new Blob([buffer], { type });
+                const file = new File([blob], name, { type });
+
+                // ===== Step 1: Vercel Blob에 직접 업로드 (클라이언트 → Blob) =====
+                setCurrentStep(0);
+                setProgress(5);
+
+                console.log("[Loading] Vercel Blob 직접 업로드 시작...");
+
+                let blobResult;
+                try {
+                    blobResult = await upload(file.name, file, {
+                        access: 'public',
+                        handleUploadUrl: '/api/upload-blob',
+                        onUploadProgress: (progressEvent) => {
+                            const pct = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+                            setUploadProgress(pct);
+                            setProgress(Math.min(5 + Math.round(pct * 0.2), 25)); // 5% ~ 25%
+                        },
+                    });
+                } catch (uploadError) {
+                    console.error("[Loading] Blob 업로드 실패:", uploadError);
+                    throw new Error("영상 업로드에 실패했습니다: " + uploadError.message);
+                }
+
+                console.log("[Loading] Blob 업로드 완료:", blobResult.url);
+
+                // ===== 지도안 업로드 (있는 경우만) =====
+                let lessonPlanUrl = null;
+                if (prepareData.lessonPlan) {
+                    console.log("[Loading] 지도안 업로드 시작...");
+                    try {
+                        // Base64를 ArrayBuffer로 변환
+                        const binaryString = atob(prepareData.lessonPlan.base64);
+                        const bytes = new Uint8Array(binaryString.length);
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i);
+                        }
+                        const lessonPlanBlob = new Blob([bytes], { type: prepareData.lessonPlan.type });
+                        const lessonPlanFile = new File([lessonPlanBlob], prepareData.lessonPlan.name, { type: prepareData.lessonPlan.type });
+
+                        const lessonPlanResult = await upload(lessonPlanFile.name, lessonPlanFile, {
+                            access: 'public',
+                            handleUploadUrl: '/api/upload-blob',
+                        });
+                        lessonPlanUrl = lessonPlanResult.url;
+                        console.log("[Loading] 지도안 업로드 완료:", lessonPlanUrl);
+                    } catch (lpError) {
+                        console.warn("[Loading] 지도안 업로드 실패 (계속 진행):", lpError.message);
+                    }
+                }
+
+                setProgress(30);
+                setCurrentStep(1);
+
+                // ===== Step 2: 분석 API 호출 =====
+                console.log("[Loading] 분석 API 호출 시작...");
+
+                // 진행률 시뮬레이션
+                let simulatedProgress = 30;
+                const progressInterval = setInterval(() => {
+                    simulatedProgress += 1;
+                    if (simulatedProgress <= 85) {
+                        setProgress(simulatedProgress);
+                        if (simulatedProgress === 50) setCurrentStep(2);
+                        if (simulatedProgress === 75) setCurrentStep(3);
+                    }
+                }, 1000);
+
+                const analyzeResponse = await fetch("/api/analyze", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        blobUrl: blobResult.url,
+                        fileName: name,
+                        mimeType: type,
+                        grade: prepareData.grade || "",
+                        subject: prepareData.subject || "",
+                        unitName: prepareData.unitName || "",
+                        feedbackAreas: (prepareData.feedbackAreas || []).join(","),
+                        lessonPlanUrl: lessonPlanUrl,
+                        conditions: prepareData.conditions || [],
+                        showScoreWithFeedback: (() => {
+                            try {
+                                const ps = localStorage.getItem("profileSettings");
+                                return ps ? JSON.parse(ps).showScoreWithFeedback || false : false;
+                            } catch { return false; }
+                        })(),
+                    }),
+                });
+
+                clearInterval(progressInterval);
+                setProgress(90);
+                setCurrentStep(3);
+
+                if (!analyzeResponse.ok) {
+                    const errorData = await analyzeResponse.json();
+                    throw new Error(errorData.error || "분석에 실패했습니다.");
+                }
+
+                const analysisResult = await analyzeResponse.json();
+                console.log("[Loading] 분석 완료");
+
+                setProgress(95);
+
+                // 결과 저장
+                sessionStorage.setItem("analysisResult", JSON.stringify(analysisResult));
+
+                // 비디오 URL 저장 (재생용) - 로컬 blob URL 사용
+                const videoUrl = URL.createObjectURL(blob);
+                sessionStorage.setItem("videoUrl", videoUrl);
+                sessionStorage.setItem("videoName", name);
+
+                // IndexedDB 정리
+                await deleteVideoDB("pendingVideo");
+
+                setProgress(100);
+
+                // 잠시 대기 후 결과 페이지로 이동
+                await new Promise((resolve) => setTimeout(resolve, 800));
+                router.push("/analysis");
+
+            } catch (err) {
+                console.error("[Loading] 분석 오류:", err);
+                setError(err.message || "영상 분석 중 오류가 발생했습니다.");
+                clearInterval(timer);
+            }
+        };
+
+        startAnalysis();
+
+        return () => clearInterval(timer);
+    }, [router]);
+
+    const formatTime = (seconds) => {
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins}:${secs.toString().padStart(2, "0")}`;
+    };
+
+    if (error) {
+        return (
+            <main className="loading-page">
+                <div className="loading-content">
+                    <div className="loading-error-icon">
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2">
+                            <circle cx="12" cy="12" r="10" />
+                            <line x1="15" y1="9" x2="9" y2="15" />
+                            <line x1="9" y1="9" x2="15" y2="15" />
+                        </svg>
+                    </div>
+                    <h1 className="loading-title">분석 오류</h1>
+                    <p className="loading-error-message">{error}</p>
+                    <button className="btn-primary" onClick={() => router.push("/upload")}>
+                        다시 시도하기
+                    </button>
+                </div>
+            </main>
+        );
+    }
+
+    return (
+        <main className="loading-page">
+            <div className="loading-content">
+                {/* 스피너 */}
+                <div className="loading-spinner-container">
+                    <div className="spinner-ring"></div>
+                    <div className="spinner-percent">{progress}%</div>
+                </div>
+
+                {/* 제목 */}
+                <h1 className="loading-title">수업 영상 분석 중</h1>
+                <p className="loading-subtitle">AI가 영상을 분석하고 있습니다. 약 1~2분 정도 소요됩니다.</p>
+
+                {/* 경과 시간 */}
+                <div className="loading-time">
+                    <span>경과 시간: {formatTime(elapsedTime)}</span>
+                </div>
+
+                {/* 전체 진행바 */}
+                <div className="loading-progress-container">
+                    <div className="loading-progress-bar">
+                        <div
+                            className="loading-progress-fill"
+                            style={{ width: `${progress}%` }}
+                        ></div>
+                    </div>
+                </div>
+
+                {/* 업로드 진행률 (첫 번째 단계에서만 표시) */}
+                {currentStep === 0 && uploadProgress > 0 && (
+                    <div className="upload-progress-detail">
+                        업로드 진행률: {uploadProgress}%
+                    </div>
+                )}
+
+                {/* 단계별 상태 */}
+                <div className="loading-steps">
+                    {ANALYSIS_STEPS.map((step, index) => (
+                        <div
+                            key={step.id}
+                            className={`loading-step-item ${index < currentStep ? "completed" :
+                                index === currentStep ? "active" : ""
+                                }`}
+                        >
+                            <div className="step-indicator">
+                                {index < currentStep ? (
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                                        <polyline points="20 6 9 17 4 12" />
+                                    </svg>
+                                ) : index === currentStep ? (
+                                    <div className="step-spinner"></div>
+                                ) : (
+                                    <span>{index + 1}</span>
+                                )}
+                            </div>
+                            <span className="step-label">{step.label}</span>
+                        </div>
+                    ))}
+                </div>
+
+                {/* 안내 메시지 */}
+                <p className="loading-hint">
+                    페이지를 닫지 마세요. 분석이 완료되면 자동으로 이동합니다.
+                </p>
+            </div>
+        </main>
+    );
+}
